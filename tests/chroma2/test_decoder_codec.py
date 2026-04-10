@@ -112,60 +112,49 @@ def test_encoder_equivalence():
 # =========================================================================
 
 def test_decoder_forward(hf_model):
-    """Test that decoder forward produces correct output.
+    """Test decoder forward via Chroma2Model.forward (the correct call path).
 
-    Uses the real encoder output (not random tensors) to ensure
-    the merged attention mask dimensions are correct.
+    Calling decoder directly requires careful mask construction.
+    Using Chroma2Model.forward ensures all internal mask logic is correct.
     """
-    print("[Test 2] Decoder single-step forward")
+    print("[Test 2] Decoder forward via Chroma2Model.forward")
 
     torch.manual_seed(42)
     batch_size = 1
-    dec_seq_len = 5
     enc_text_len = 15
+    dec_seq_len = 5
 
     config = hf_model.config
 
-    # 1. Get real encoder output first
-    text_embeds = hf_model.encoder.embed_tokens(
-        torch.randint(0, 1000, (batch_size, enc_text_len), device=DEVICE)
-    )
-    with torch.no_grad():
-        enc_out = hf_model.encoder(
-            inputs_embeds=text_embeds,
-            attention_mask=torch.ones(batch_size, enc_text_len, device=DEVICE),
-        )
-    encoder_hidden = enc_out.last_hidden_state
-    encoder_mask = enc_out.attention_mask
+    # 1. Encoder inputs
+    encoder_input_ids = torch.randint(0, 1000, (batch_size, enc_text_len), device=DEVICE)
+    encoder_attention_mask = torch.ones(batch_size, enc_text_len, device=DEVICE)
 
-    # 2. Decoder forward with real encoder output
-    decoder_input_ids = torch.randint(
-        0, config.decoder_config.text_vocab_size,
-        (batch_size, dec_seq_len), device=DEVICE
-    )
+    # 2. Decoder inputs (text tokens only, no audio features)
+    decoder_input_ids = torch.randint(0, 1000, (batch_size, dec_seq_len), device=DEVICE)
     decoder_attention_mask = torch.ones(batch_size, dec_seq_len, device=DEVICE)
-    cache_position = torch.arange(dec_seq_len, device=DEVICE)
 
     with torch.no_grad():
-        decoder_output = hf_model.decoder(
+        outputs = hf_model(
+            encoder_input_ids=encoder_input_ids,
+            encoder_attention_mask=encoder_attention_mask,
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
-            encoder_last_hidden_state=encoder_hidden,
-            encoder_attention_mask=encoder_mask,
-            cache_position=cache_position,
             use_cache=False,
+            return_loss=False,
         )
 
-    hidden = decoder_output.last_hidden_state
-    logits = decoder_output.logits
+    encoder_hidden = outputs.encoder_last_hidden_state
+    decoder_hidden = outputs.decoder_last_hidden_state
+    decoder_logits = outputs.decoder_logits
 
     print(f"  Encoder hidden shape: {encoder_hidden.shape}")
-    print(f"  Decoder hidden shape: {hidden.shape}")
-    print(f"  Decoder logits shape: {logits.shape}")
-    print(f"  Decoder hidden mean: {hidden.mean():.6f}")
+    print(f"  Decoder hidden shape: {decoder_hidden.shape}")
+    print(f"  Decoder logits shape: {decoder_logits.shape}")
+    print(f"  Decoder hidden mean: {decoder_hidden.mean():.6f}")
     print(f"  PASSED\n")
 
-    return encoder_hidden, encoder_mask
+    return encoder_hidden, outputs.encoder_attention_mask
 
 
 # =========================================================================
@@ -239,39 +228,32 @@ def test_codec_decode(hf_model, frame_codes):
 # =========================================================================
 
 def test_full_pipeline(hf_model):
-    """End-to-end: encoder → decoder (1 frame) → depth_decoder → codec."""
+    """End-to-end: encoder → decoder → depth_decoder → codec via Chroma2Model."""
     print("[Test 5] Full pipeline: encoder → decoder → depth → codec")
 
     from transformers.models.mimi import MimiModel
 
     torch.manual_seed(42)
-    config = hf_model.config
 
-    # 1. Encoder
-    text_embeds = hf_model.encoder.embed_tokens(
-        torch.randint(0, 1000, (1, 15), device=DEVICE)
-    )
-    with torch.no_grad():
-        enc_out = hf_model.encoder(
-            inputs_embeds=text_embeds,
-            attention_mask=torch.ones(1, 15, device=DEVICE),
-        )
-    encoder_hidden = enc_out.last_hidden_state
-    print(f"  1. Encoder: {encoder_hidden.shape}")
+    # 1+2. Encoder + Decoder via Chroma2Model.forward
+    encoder_input_ids = torch.randint(0, 1000, (1, 15), device=DEVICE)
+    decoder_input_ids = torch.randint(0, 1000, (1, 3), device=DEVICE)
 
-    # 2. Decoder (1 step)
-    dec_input = torch.randint(0, 1000, (1, 3), device=DEVICE)
     with torch.no_grad():
-        dec_out = hf_model.decoder(
-            input_ids=dec_input,
-            attention_mask=torch.ones(1, 3, device=DEVICE),
-            encoder_last_hidden_state=encoder_hidden,
+        outputs = hf_model(
+            encoder_input_ids=encoder_input_ids,
             encoder_attention_mask=torch.ones(1, 15, device=DEVICE),
+            input_ids=decoder_input_ids,
+            attention_mask=torch.ones(1, 3, device=DEVICE),
             use_cache=False,
+            return_loss=False,
         )
-    decoder_hidden = dec_out.last_hidden_state[:, -1, :]
-    decoder_logits = dec_out.logits[:, -1, :]
+
+    encoder_hidden = outputs.encoder_last_hidden_state
+    decoder_hidden = outputs.decoder_last_hidden_state[:, -1, :]
+    decoder_logits = outputs.decoder_logits[:, -1, :]
     codebook_0 = decoder_logits.argmax(dim=-1, keepdim=True)
+    print(f"  1. Encoder: {encoder_hidden.shape}")
     print(f"  2. Decoder: hidden={decoder_hidden.shape}, c0={codebook_0.item()}")
 
     # 3. DepthDecoder
