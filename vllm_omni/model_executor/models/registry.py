@@ -162,6 +162,22 @@ _OMNI_MODELS = {
         "dynin_omni",
         "DyninOmniForConditionalGeneration",
     ),
+    ## Chroma2 (encoder-decoder TTS with merged attention)
+    "Chroma2ForConditionalGeneration": (
+        "chroma2",
+        "chroma2",
+        "Chroma2ForConditionalGeneration",
+    ),
+    "Chroma2DecoderModel": (
+        "chroma2",
+        "chroma2_decoder",
+        "Chroma2DecoderForGeneration",
+    ),
+    "Chroma2CodecModel": (
+        "chroma2",
+        "chroma2_codec",
+        "Chroma2CodecForGeneration",
+    ),
 }
 
 
