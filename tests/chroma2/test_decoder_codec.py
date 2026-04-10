@@ -112,29 +112,39 @@ def test_encoder_equivalence():
 # =========================================================================
 
 def test_decoder_forward(hf_model):
-    """Test that decoder forward produces correct output."""
+    """Test that decoder forward produces correct output.
+
+    Uses the real encoder output (not random tensors) to ensure
+    the merged attention mask dimensions are correct.
+    """
     print("[Test 2] Decoder single-step forward")
 
     torch.manual_seed(42)
     batch_size = 1
     dec_seq_len = 5
-    enc_seq_len = 30
+    enc_text_len = 15
 
     config = hf_model.config
 
-    # Synthetic encoder output
-    encoder_hidden = torch.randn(
-        batch_size, enc_seq_len, config.decoder_config.hidden_size, device=DEVICE
+    # 1. Get real encoder output first
+    text_embeds = hf_model.encoder.embed_tokens(
+        torch.randint(0, 1000, (batch_size, enc_text_len), device=DEVICE)
     )
-    encoder_mask = torch.ones(batch_size, enc_seq_len, device=DEVICE)
+    with torch.no_grad():
+        enc_out = hf_model.encoder(
+            inputs_embeds=text_embeds,
+            attention_mask=torch.ones(batch_size, enc_text_len, device=DEVICE),
+        )
+    encoder_hidden = enc_out.last_hidden_state
+    encoder_mask = enc_out.attention_mask
 
-    # Decoder input: mix of text tokens and audio tokens
-    # For simplicity, use random text tokens
+    # 2. Decoder forward with real encoder output
     decoder_input_ids = torch.randint(
         0, config.decoder_config.text_vocab_size,
         (batch_size, dec_seq_len), device=DEVICE
     )
     decoder_attention_mask = torch.ones(batch_size, dec_seq_len, device=DEVICE)
+    cache_position = torch.arange(dec_seq_len, device=DEVICE)
 
     with torch.no_grad():
         decoder_output = hf_model.decoder(
@@ -142,12 +152,14 @@ def test_decoder_forward(hf_model):
             attention_mask=decoder_attention_mask,
             encoder_last_hidden_state=encoder_hidden,
             encoder_attention_mask=encoder_mask,
+            cache_position=cache_position,
             use_cache=False,
         )
 
     hidden = decoder_output.last_hidden_state
     logits = decoder_output.logits
 
+    print(f"  Encoder hidden shape: {encoder_hidden.shape}")
     print(f"  Decoder hidden shape: {hidden.shape}")
     print(f"  Decoder logits shape: {logits.shape}")
     print(f"  Decoder hidden mean: {hidden.mean():.6f}")
