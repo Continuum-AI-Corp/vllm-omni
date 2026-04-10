@@ -15,6 +15,13 @@ Run on server:
 import sys
 import os
 import importlib.util
+from unittest.mock import MagicMock
+
+# Patch missing symbols in newer transformers before importing chroma2
+# chroma2 was written for transformers 5.0.0rc0; some names moved in 5.5.0
+import transformers.utils.generic as _generic_mod
+if not hasattr(_generic_mod, "OutputRecorder"):
+    _generic_mod.OutputRecorder = MagicMock
 
 # Direct import of our vLLM attention module (avoids vllm_omni.__init__ deps)
 _ATTN_PATH = os.path.join(
