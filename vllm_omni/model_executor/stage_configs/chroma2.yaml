@@ -1,0 +1,141 @@
+# Stage config for Chroma2 3-stage pipeline.
+#
+# Stage 0: Thinker (Qwen2.5-Omni text generation)
+# Stage 1: Encoder + Decoder + DepthDecoder (codebook generation)
+# Stage 2: Mimi Codec (codebook -> audio waveform)
+#
+# Verified on: 2x H100-80G GPU (Stage 0 on GPU 0, Stage 1+2 on GPU 1)
+# For single GPU: set all devices to "0" and reduce max_num_seqs.
+
+async_chunk: true
+
+stage_args:
+  # =========================================================================
+  # Stage 0: Thinker (Qwen2.5-Omni-3B)
+  # Generates text token IDs streamed to Stage 1 via async_chunk.
+  # The thinker is independent of the decoder — no feedback loop.
+  # =========================================================================
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: thinker
+      max_num_seqs: 8
+      model_arch: Chroma2ForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.4
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.chroma2.thinker_to_decoder_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+
+  # =========================================================================
+  # Stage 1: Encoder + Decoder + DepthDecoder
+  # - Prefill: runs Encoder once to produce encoder_hidden_state
+  # - Decode: consumes thinker tokens from Stage 0, generates codebook_0
+  #           per frame via decoder with cross-attention to encoder output,
+  #           then runs depth_decoder inline to produce codebook_1~7
+  # - Streams codebook chunks to Stage 2
+  #
+  # Uses enforce_eager=true because MergedAttention uses custom flash_attn
+  # (self + cross KV concat), not vLLM's PagedAttention.
+  # =========================================================================
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "1"
+    engine_args:
+      model_stage: decoder
+      max_num_seqs: 8
+      model_arch: Chroma2ForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.7
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 16384
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.chroma2.decoder_to_codec_async_chunk
+    engine_input_source: [0]
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      top_k: 50
+      top_p: 0.9
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+
+  # =========================================================================
+  # Stage 2: Mimi Codec Decode
+  # Receives codebook frames (8 codebooks per frame) from Stage 1.
+  # Decodes to audio waveform in one shot (non-autoregressive).
+  # =========================================================================
+  - stage_id: 2
+    stage_type: llm
+    runtime:
+      devices: "1"
+    engine_args:
+      model_stage: codec
+      max_num_seqs: 8
+      model_arch: Chroma2ForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.1
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: audio
+      enable_prefix_caching: false
+      max_num_batched_tokens: 16384
+      async_scheduling: false
+    engine_input_source: [1]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+
+# ==========================================================================
+# Runtime: connector and pipeline configuration
+# ==========================================================================
+runtime:
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        # Chroma2 concat_pattern "T,T,T,A,A,A,A,A,A":
+        # every 3 thinker tokens produce 6 audio frames.
+        # codec_chunk_frames=6 aligns with one pattern cycle.
+        codec_chunk_frames: 6
+        codec_left_context_frames: 6
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
