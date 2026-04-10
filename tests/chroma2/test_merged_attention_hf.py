@@ -56,8 +56,8 @@ def copy_weights(hf_attn: Chroma2MergedAttention, vllm_attn: Chroma2MergedAttent
     vllm_attn.k_norm.load_state_dict(hf_attn.k_norm.state_dict())
 
 
-class MockConfig:
-    """Config matching Chroma2DecoderConfig defaults."""
+class VLLMConfig:
+    """Minimal config for vLLM MergedAttention (no transformers dependency)."""
     hidden_size = 2048
     num_attention_heads = 16
     num_key_value_heads = 4
@@ -67,8 +67,6 @@ class MockConfig:
     query_pre_attn_scalar = 256
     attention_dropout = 0.0
     is_causal = True
-    attn_logit_softcapping = None
-    sliding_window = None
 
 
 def build_merged_attention_mask(decoder_seq_len: int, encoder_seq_len: int, device="cpu"):
@@ -115,13 +113,14 @@ def test_prefill_with_real_hf():
         rms_norm_eps=1e-5,
         is_causal=True,
         audio_num_codebooks=8,
+        num_hidden_layers=1,
     )
     # Force eager attention (no flash_attn on CPU)
     config._attn_implementation = "eager"
 
     # Create both models
     hf_attn = Chroma2MergedAttention(config, layer_idx=0).to(device).eval()
-    vllm_attn = Chroma2MergedAttentionVLLM(MockConfig(), layer_idx=0).to(device).eval()
+    vllm_attn = Chroma2MergedAttentionVLLM(VLLMConfig(), layer_idx=0).to(device).eval()
     copy_weights(hf_attn, vllm_attn)
 
     # Real RoPE
@@ -133,7 +132,7 @@ def test_prefill_with_real_hf():
 
     # Real position embeddings from Chroma2RotaryEmbedding
     position_ids = torch.arange(dec_len, device=device).unsqueeze(0)
-    cos, sin = rotary_emb(dec_hidden, position_ids)
+    cos, sin = rotary_emb(dec_hidden, position_ids, layer_type="full_attention")
 
     # Real merged attention mask
     mask = build_merged_attention_mask(dec_len, enc_len, device)
@@ -191,7 +190,7 @@ def test_decode_with_real_hf_cache():
     config._attn_implementation = "eager"
 
     hf_attn = Chroma2MergedAttention(config, layer_idx=0).to(device).eval()
-    vllm_attn = Chroma2MergedAttentionVLLM(MockConfig(), layer_idx=0).to(device).eval()
+    vllm_attn = Chroma2MergedAttentionVLLM(VLLMConfig(), layer_idx=0).to(device).eval()
     copy_weights(hf_attn, vllm_attn)
 
     rotary_emb = Chroma2RotaryEmbedding(config).to(device)
@@ -205,7 +204,7 @@ def test_decode_with_real_hf_cache():
     # --- HF prefill with EncoderDecoderCache ---
     hf_cache = EncoderDecoderCache(DynamicCache(), DynamicCache())
     position_ids = torch.arange(prefill_len, device=device).unsqueeze(0)
-    cos, sin = rotary_emb(prefill_hidden, position_ids)
+    cos, sin = rotary_emb(prefill_hidden, position_ids, layer_type="full_attention")
     cache_position = torch.arange(prefill_len, device=device)
     mask = build_merged_attention_mask(prefill_len, enc_len, device)
 
@@ -250,7 +249,7 @@ def test_decode_with_real_hf_cache():
 
         # Real RoPE for this position
         step_position_ids = torch.tensor([[pos]], device=device)
-        cos_step, sin_step = rotary_emb(step_hidden, step_position_ids)
+        cos_step, sin_step = rotary_emb(step_hidden, step_position_ids, layer_type="full_attention")
         cache_pos = torch.tensor([pos], device=device)
 
         # HF: decode mask (1 query attending to pos+1 self tokens + enc_len cross tokens)
